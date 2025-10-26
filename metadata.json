@@ -1,0 +1,7 @@
+{
+  "name": "Copy of AniFind: AI Anime Song Finder",
+  "description": "An application that listens to your audio, transcribes it, and identifies the anime song you're looking for using AI.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
