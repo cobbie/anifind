@@ -4,16 +4,25 @@ import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import type { LiveSession } from '@google/genai';
 import { ResultDisplay } from './components/ResultDisplay';
 import { ANIFIND_SYSTEM_INSTRUCTION } from './constants';
-import { encode, createBlob } from './utils/audio';
+import { createBlob } from './utils/audio';
 import { MicrophoneIcon, StopIcon, LoadingIcon, MusicNoteIcon } from './components/icons';
 
 type Status = 'idle' | 'recording' | 'processing' | 'success' | 'error';
 
+type GroundingChunk = {
+  web?: {
+    uri: string;
+    title: string;
+  };
+};
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
+  const [textInput, setTextInput] = useState('');
   const [transcribedText, setTranscribedText] = useState('');
   const [finalTranscription, setFinalTranscription] = useState('');
   const [analysisResult, setAnalysisResult] = useState('');
+  const [groundingSources, setGroundingSources] = useState<GroundingChunk[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const sessionPromiseRef = useRef<Promise<LiveSession> | null>(null);
@@ -21,12 +30,67 @@ export default function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
+  const cleanup = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(console.error);
+      audioContextRef.current = null;
+    }
+  }, []);
+
+  const analyzeText = useCallback(async (text: string) => {
+    if (!text.trim()) {
+      setError("Cannot analyze empty text. Please record audio or type something.");
+      setStatus('error');
+      return;
+    }
+
+    setStatus('processing');
+    setError(null);
+    setAnalysisResult('');
+    setGroundingSources([]);
+    setFinalTranscription(text);
+    setTranscribedText(''); 
+    setTextInput('');
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const userPrompt = `The user provided the following lyrics, transcription, or description: "${text}". Please identify the anime song based on this.`;
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: userPrompt,
+        config: {
+          systemInstruction: ANIFIND_SYSTEM_INSTRUCTION,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+      setAnalysisResult(response.text);
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+      if (chunks) {
+        setGroundingSources(chunks);
+      }
+      setStatus('success');
+    } catch (err) {
+      console.error('Analysis error:', err);
+      setError('Failed to analyze the input. Please try again.');
+      setStatus('error');
+    }
+  }, []);
+  
   const startRecording = async () => {
     setStatus('recording');
     setError(null);
     setTranscribedText('');
     setFinalTranscription('');
     setAnalysisResult('');
+    setGroundingSources([]);
     
     try {
       streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -39,7 +103,6 @@ export default function App() {
           onopen: () => {
             console.log('Session opened.');
             if (!streamRef.current) return;
-            // FIX: Cast window to `any` to allow access to webkitAudioContext for broader browser compatibility.
             audioContextRef.current = new ((window as any).AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
             const source = audioContextRef.current.createMediaStreamSource(streamRef.current);
             scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
@@ -88,9 +151,6 @@ export default function App() {
   };
   
   const stopRecordingAndAnalyze = useCallback(async () => {
-    setStatus('processing');
-    setFinalTranscription(transcribedText);
-
     if (sessionPromiseRef.current) {
       try {
         const session = await sessionPromiseRef.current;
@@ -101,45 +161,13 @@ export default function App() {
     }
     sessionPromiseRef.current = null;
     cleanup();
+    analyzeText(transcribedText);
+  }, [transcribedText, cleanup, analyzeText]);
 
-    if (!transcribedText.trim()) {
-      setError("No audio was transcribed. Please try recording again.");
-      setStatus('error');
-      return;
-    }
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: transcribedText,
-        config: {
-          systemInstruction: ANIFIND_SYSTEM_INSTRUCTION,
-        },
-      });
-      setAnalysisResult(response.text);
-      setStatus('success');
-    } catch (err) {
-      console.error('Analysis error:', err);
-      setError('Failed to analyze the transcription. Please try again.');
-      setStatus('error');
-    }
-  }, [transcribedText]);
-
-  const cleanup = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-  };
+  const handleTextSubmit = useCallback(() => {
+    if (!textInput.trim()) return;
+    analyzeText(textInput);
+  }, [textInput, analyzeText]);
 
   const reset = () => {
     setStatus('idle');
@@ -147,6 +175,8 @@ export default function App() {
     setTranscribedText('');
     setFinalTranscription('');
     setAnalysisResult('');
+    setGroundingSources([]);
+    setTextInput('');
     cleanup();
   };
 
@@ -155,7 +185,7 @@ export default function App() {
       case 'recording':
         return "Listening... Speak or play the song now.";
       case 'processing':
-        return "Transcription complete. Finding your song...";
+        return "Processing... Finding your song...";
       case 'success':
         return "Here's what I found:";
       case 'error':
@@ -219,13 +249,51 @@ export default function App() {
             )}
           </div>
           
-          {(status !== 'idle') && (
-            <div className="bg-gray-900/70 rounded-xl p-4 min-h-[80px] border border-gray-700">
+          {status === 'idle' && (
+            <>
+              <div className="relative flex items-center my-4">
+                <div className="flex-grow border-t border-gray-700"></div>
+                <span className="flex-shrink mx-4 text-gray-400">OR</span>
+                <div className="flex-grow border-t border-gray-700"></div>
+              </div>
+              <div className="space-y-4">
+                <textarea
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value)}
+                  placeholder="Type lyrics, a description of the melody, or any other clues..."
+                  className="w-full bg-gray-900/70 border border-gray-700 rounded-lg p-3 text-gray-200 focus:ring-2 focus:ring-cyan-500 focus:outline-none transition-shadow"
+                  rows={3}
+                  disabled={status !== 'idle'}
+                />
+                <button
+                  onClick={handleTextSubmit}
+                  disabled={!textInput.trim() || status !== 'idle'}
+                  className="w-full flex items-center justify-center gap-3 px-6 py-3 bg-purple-600 hover:bg-purple-700 text-white font-bold rounded-full text-lg shadow-lg transform hover:scale-105 transition-all duration-300 disabled:bg-gray-600 disabled:scale-100 disabled:cursor-not-allowed"
+                >
+                  Analyze Text
+                </button>
+              </div>
+            </>
+          )}
+
+          {(status !== 'idle' && finalTranscription) && (
+            <div className="bg-gray-900/70 rounded-xl p-4 min-h-[80px] border border-gray-700 mt-6">
               <h3 className="font-semibold text-gray-400 mb-2">
-                {status === 'processing' || status === 'success' || status === 'error' ? 'Final Transcription:' : 'Live Transcription:'}
+                Your Input:
               </h3>
               <p className="text-gray-200 italic">
-                {status === 'processing' || status === 'success' || status === 'error' ? finalTranscription : transcribedText || "..."}
+                {finalTranscription}
+              </p>
+            </div>
+          )}
+
+          {status === 'recording' && (
+             <div className="bg-gray-900/70 rounded-xl p-4 min-h-[80px] border border-gray-700 mt-6">
+              <h3 className="font-semibold text-gray-400 mb-2">
+                Live Transcription:
+              </h3>
+              <p className="text-gray-200 italic">
+                {transcribedText || "..."}
               </p>
             </div>
           )}
@@ -233,7 +301,11 @@ export default function App() {
           {error && <div className="mt-6 text-center text-red-400 bg-red-900/50 p-4 rounded-lg">{error}</div>}
 
           <div className="mt-8">
-            <ResultDisplay result={analysisResult} isLoading={status === 'processing'} />
+            <ResultDisplay 
+              result={analysisResult} 
+              isLoading={status === 'processing'}
+              sources={groundingSources} 
+            />
           </div>
         </main>
       </div>
